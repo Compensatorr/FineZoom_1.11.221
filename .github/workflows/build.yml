@@ -1,0 +1,130 @@
+name: Build FineZoom
+
+# Runs only when you press the "Run workflow" button on the Actions tab.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the repository files
+        uses: actions/checkout@v4
+
+      - name: Unpack the three zip files and find their folders
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import os, shutil, sys, zipfile
+
+          def unpack(zip_name, dest):
+              if not os.path.exists(zip_name):
+                  sys.exit("MISSING FILE in the repository: " + zip_name)
+              with zipfile.ZipFile(zip_name) as z:
+                  z.extractall(dest)
+
+          def find_root(base, marker):
+              # shallowest folder that contains the marker file
+              for root, dirs, files in os.walk(base):
+                  if os.path.exists(os.path.join(root, marker)):
+                      return os.path.abspath(root).replace("\\", "/")
+              sys.exit("Could not find '%s' inside %s" % (marker, base))
+
+          unpack("f4se_src.zip", "work/f4se_unz")
+          unpack("common-master.zip", "work/common_unz")
+          unpack("FineZoom_src.zip", "work/proj_unz")
+
+          # Copy each folder to a plain ASCII name (some zips contain folders with spaces or
+          # non-English letters in the name, which compilers can choke on).
+          def relocate(found, target):
+              shutil.copytree(found, target)
+              return os.path.abspath(target).replace("\\", "/")
+
+          f4se_root = relocate(find_root("work/f4se_unz", "f4se/CMakeLists.txt"), "work/f4se_src")
+          common_root = relocate(find_root("work/common_unz", "common/IPrefix.h"), "work/common_src")
+          proj_root = relocate(find_root("work/proj_unz", "FineZoom.cpp"), "work/finezoom_src")
+          work = os.path.abspath("work").replace("\\", "/")
+
+          print("F4SE_ROOT   =", f4se_root)
+          print("COMMON_ROOT =", common_root)
+          print("PROJ_ROOT   =", proj_root)
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("F4SE_ROOT=%s\n" % f4se_root)
+              f.write("COMMON_ROOT=%s\n" % common_root)
+              f.write("PROJ_ROOT=%s\n" % proj_root)
+              f.write("WORK=%s\n" % work)
+          PYEOF
+
+      - name: Show which F4SE version this source is
+        shell: bash
+        run: |
+          cat "$F4SE_ROOT/cmake/versioning.cmake" | head -8
+
+      - name: Build and install the 'common' library
+        shell: bash
+        run: |
+          cmake -S "$COMMON_ROOT" -B "$WORK/common_build" -DCMAKE_INSTALL_PREFIX="$WORK/extern"
+          cmake --build "$WORK/common_build" --config Release --target install
+
+      - name: Configure FineZoom (also configures F4SE as a static library)
+        shell: bash
+        run: |
+          cmake -S "$PROJ_ROOT" -B "$WORK/build" -DF4SE_ROOT="$F4SE_ROOT" -DCMAKE_PREFIX_PATH="$WORK/extern"
+
+      - name: Build FineZoom.dll
+        shell: bash
+        run: |
+          cmake --build "$WORK/build" --config Release
+
+      - name: Check the finished DLL (exports and version block)
+        shell: bash
+        run: |
+          python - <<'PYEOF'
+          import os, struct, sys
+          path = os.path.join(os.environ["WORK"], "build", "Release", "FineZoom.dll")
+          d = open(path, "rb").read()
+          pe = struct.unpack_from("<I", d, 0x3C)[0]
+          nsec, = struct.unpack_from("<H", d, pe + 6)
+          optsz, = struct.unpack_from("<H", d, pe + 20)
+          opt = pe + 24
+          st = opt + optsz
+          secs = []
+          for i in range(nsec):
+              o = st + i * 40
+              vs, va, rs, rp = struct.unpack_from("<IIII", d, o + 8)
+              secs.append((va, max(vs, rs), rp))
+          def off(rva):
+              for va, sz, rp in secs:
+                  if va <= rva < va + sz:
+                      return rva - va + rp
+              raise ValueError(hex(rva))
+          erva, _ = struct.unpack_from("<II", d, opt + 112)
+          eo = off(erva)
+          (_c, _t, _a, _b, _n, base, nf, nn, af, an, ao) = struct.unpack_from("<IIHHIIIIIII", d, eo)
+          ex = {}
+          for i in range(nn):
+              nr, = struct.unpack_from("<I", d, off(an) + 4 * i)
+              idx, = struct.unpack_from("<H", d, off(ao) + 2 * i)
+              fr, = struct.unpack_from("<I", d, off(af) + 4 * idx)
+              o = off(nr)
+              ex[d[o:d.index(b"\0", o)].decode()] = fr
+          print("Exports:", sorted(ex))
+          if "F4SEPlugin_Version" not in ex or "F4SEPlugin_Load" not in ex:
+              sys.exit("ERROR: F4SEPlugin_Version / F4SEPlugin_Load export is missing")
+          o = off(ex["F4SEPlugin_Version"])
+          dv, pv = struct.unpack_from("<II", d, o)
+          name = d[o + 8:o + 8 + 256].split(b"\0")[0].decode()
+          cv = struct.unpack_from("<16I", d, o + 0x210)
+          print("dataVersion", dv, "| name", name, "| compatible versions", [hex(x) for x in cv if x])
+          if 0x010B0DD0 not in cv:
+              sys.exit("ERROR: version block does not list 1.11.221 (0x010B0DD0)")
+          print("OK: DLL looks correct")
+          PYEOF
+
+      - name: Upload FineZoom.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: FineZoom-dll
+          path: work/build/Release/FineZoom.dll
+          if-no-files-found: error
